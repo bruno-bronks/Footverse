@@ -29,6 +29,7 @@ from ..world import World
 logger = logging.getLogger("footverse.agents")
 
 AGENT_MODEL: str = os.getenv("FOOTVERSE_AGENT_MODEL", "gpt-4o-mini")
+MEMORY_DIR: str | None = os.getenv("FOOTVERSE_MEMORY_DIR")
 
 _PERSONALIDADES: dict[str, str] = {
     "agressivo": (
@@ -54,15 +55,19 @@ vender_jogador, escalar_time) são executadas de verdade pelo motor do jogo.
 Personalidade: {personalidade}
 
 Seu objetivo nesta rodada:
-1. Verifique o elenco (ver_elenco) e a escalação ativa (ver_escalacao).
-2. Se houver menos de 11 jogadores aptos a titular, ou lacunas de posição
+1. Se a tool buscar_historico estiver disponível, consulte-a primeiro (ex:
+   "resultado das últimas temporadas", "padrão de compras e vendas") — use
+   esse contexto para informar a decisão (ex: evite repetir um erro do
+   passado, mantenha consistência com a estratégia que já vinha seguindo).
+2. Verifique o elenco (ver_elenco) e a escalação ativa (ver_escalacao).
+3. Se houver menos de 11 jogadores aptos a titular, ou lacunas de posição
    (faltam GOL, ZAG, LAT, VOL, MEI, EXT ou ATA suficientes), avalie o mercado
    (ver_mercado) e o saldo (ver_clube), e compre jogadores com comprar_jogador
    — sempre dentro do orçamento disponível.
-3. Garanta que, ao final, exista uma escalação válida (11 titulares, 1 GOL,
+4. Garanta que, ao final, exista uma escalação válida (11 titulares, 1 GOL,
    formação suportada) usando escalar_time — a rodada só pontua corretamente
    se houver uma escalação ativa.
-4. Se tiver reservas excedentes e quiser caixa, considere vender_jogador por
+5. Se tiver reservas excedentes e quiser caixa, considere vender_jogador por
    um preço próximo do valor de mercado dele.
 
 Regras invioláveis:
@@ -80,16 +85,39 @@ class ClubManager:
     o grafo sob demanda para sempre refletir o estado mais recente do World.
     """
 
-    def __init__(self, world: World, model: str = AGENT_MODEL) -> None:
+    def __init__(
+        self,
+        world: World,
+        model: str = AGENT_MODEL,
+        memory_dir: str | None = MEMORY_DIR,
+        _memory_embedding_fn=None,  # injeção para testes (evita download ONNX)
+    ) -> None:
         self._world = world
         self._model_name = model
+        self._memory_dir = memory_dir
+        self._memory_embedding_fn = _memory_embedding_fn
+
+    def _get_memory(self, club_id: str):
+        """Retorna um MemoryStore pronto (índice já construído) ou None."""
+        try:
+            from .memory import MemoryStore
+            mem = MemoryStore(
+                self._world.store, club_id,
+                persist_dir=self._memory_dir,
+                _embedding_fn=self._memory_embedding_fn,
+            )
+            mem.build()
+            return mem
+        except ImportError:
+            return None
 
     def _build_graph(self, club_id: str, personalidade: str):
         from langchain.agents import create_agent
         from langchain_openai import ChatOpenAI
 
         llm = ChatOpenAI(model=self._model_name, temperature=0.3)
-        tools = make_tools(self._world, club_id) + make_action_tools(self._world, club_id)
+        memory = self._get_memory(club_id)
+        tools = make_tools(self._world, club_id, memory=memory) + make_action_tools(self._world, club_id)
         prompt = _MANAGER_PROMPT_TEMPLATE.format(
             personalidade=_PERSONALIDADES.get(personalidade, _PERSONALIDADES["equilibrado"])
         )

@@ -206,6 +206,36 @@ def test_advisor_usa_memory_com_hash_embedding():
     assert mem._col.count() > 0
 
 
+# ── integração com ClubManager (Fase 4) ────────────────────────────────────
+
+def test_club_manager_usa_memory_com_hash_embedding():
+    """ClubManager._get_memory retorna MemoryStore quando chromadb está disponível."""
+    from footverse.agents.manager import ClubManager
+
+    world = World("MEM_TEST")
+    club = world.criar_clube_ia("Robot FC", _CORES)
+
+    manager = ClubManager(world, _memory_embedding_fn=_SimpleHashEmbedding())
+    mem = manager._get_memory(club.id)
+    assert mem is not None
+    assert mem._col.count() > 0
+
+
+def test_club_manager_build_graph_inclui_buscar_historico(monkeypatch):
+    """O grafo do ClubManager (com memória) expõe a tool buscar_historico."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake")
+    from footverse.agents.manager import ClubManager
+
+    world = World("MEM_TEST")
+    club = world.criar_clube_ia("Robot FC", _CORES)
+
+    manager = ClubManager(world, _memory_embedding_fn=_SimpleHashEmbedding())
+    graph = manager._build_graph(club.id, "equilibrado")
+    # o ToolNode do grafo deve conhecer a tool buscar_historico
+    tool_node = graph.nodes["tools"].bound
+    assert "buscar_historico" in tool_node.tools_by_name
+
+
 def test_get_ledger_store_in_memory():
     """Store.get_ledger retorna os lançamentos do clube."""
     world = World("MEM_TEST")
