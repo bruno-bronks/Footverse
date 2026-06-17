@@ -172,6 +172,74 @@ def test_club_manager_build_graph_nao_quebra(monkeypatch):
     assert graph is not None
 
 
+# ── limite de passos por decisão (controle de custo) ────────────────────────
+# Achado real: uma decisão chegou a chamar tools 78 vezes numa única rodada
+# (escalar_time sozinho 31 vezes). FOOTVERSE_AGENT_MAX_STEPS limita isso via
+# recursion_limit do LangGraph. Testado sem chamar o LLM de verdade —
+# substitui _build_graph por um grafo fake que captura o config recebido.
+
+class _ConfigCapturingGraph:
+    """Grafo fake: registra o `config` recebido e devolve uma resposta fixa."""
+
+    def __init__(self):
+        self.received_config: dict | None = None
+
+    def invoke(self, input, config=None):
+        self.received_config = config
+        return {"messages": [type("M", (), {"content": "ok"})()]}
+
+
+class _RecursionErrorGraph:
+    """Grafo fake: sempre levanta GraphRecursionError, como se tivesse
+    excedido o limite de passos configurado."""
+
+    def invoke(self, input, config=None):
+        from langgraph.errors import GraphRecursionError
+        raise GraphRecursionError("limite de passos excedido")
+
+
+def test_club_manager_aplica_recursion_limit(monkeypatch):
+    from footverse.agents import manager as manager_module
+
+    world = World("STEP_LIMIT_TEST")
+    club = world.criar_clube_ia("Robot FC", _CORES)
+    mgr = manager_module.ClubManager(world)
+    fake_graph = _ConfigCapturingGraph()
+    monkeypatch.setattr(mgr, "_build_graph", lambda *a, **k: fake_graph)
+
+    mgr.decide(club.id)
+
+    assert fake_graph.received_config is not None
+    assert fake_graph.received_config["recursion_limit"] == manager_module.AGENT_MAX_STEPS
+
+
+def test_club_manager_trata_limite_excedido_sem_propagar_excecao(monkeypatch):
+    from footverse.agents import manager as manager_module
+
+    world = World("STEP_LIMIT_TEST2")
+    club = world.criar_clube_ia("Robot FC", _CORES)
+    mgr = manager_module.ClubManager(world)
+    monkeypatch.setattr(mgr, "_build_graph", lambda *a, **k: _RecursionErrorGraph())
+
+    resultado = mgr.decide(club.id)  # não deve lançar
+    assert "limite" in resultado.lower()
+
+
+def test_run_ai_manager_sobrevive_a_limite_de_passos_excedido(monkeypatch):
+    """O tick/World continuam normalmente mesmo se a IA bater no teto de passos."""
+    from footverse.agents import manager as manager_module
+
+    world = World("STEP_LIMIT_TEST3")
+    club = world.criar_clube_ia("Robot FC", _CORES)
+    mgr = manager_module.ClubManager(world)
+    monkeypatch.setattr(mgr, "_build_graph", lambda *a, **k: _RecursionErrorGraph())
+    world._ai_manager = mgr
+
+    resultado = world.run_ai_manager(club.id)
+    assert resultado is not None
+    assert "limite" in resultado.lower()
+
+
 # ── action tools (sem LLM) ───────────────────────────────────────────────────
 def _world_ia_com_clube() -> tuple[World, str]:
     world = World("AI_TOOLS_TEST")

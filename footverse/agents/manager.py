@@ -13,6 +13,14 @@ instalado), o clube simplesmente não age nesta rodada — mantém o que já tin
 Variáveis de ambiente:
   OPENAI_API_KEY             — obrigatória para invocar o LLM
   FOOTVERSE_AGENT_MODEL      — nome do modelo OpenAI (padrão: gpt-4o-mini)
+  FOOTVERSE_AGENT_MAX_STEPS  — teto de passos (model+tool) por decisão (padrão: 20)
+
+Custo sem teto é um risco real, não hipotético: numa decisão observada em
+teste manual, o agente chamou tools 78 vezes numa única rodada (`escalar_time`
+sozinho 31 vezes, claramente tentando às cegas sem ajustar a causa do erro).
+`FOOTVERSE_AGENT_MAX_STEPS` limita isso via `recursion_limit` do LangGraph —
+ações já tomadas até o limite ser atingido permanecem (cada tool já mexeu no
+motor de verdade); só a conversa com o LLM é interrompida.
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ logger = logging.getLogger("footverse.agents")
 
 AGENT_MODEL: str = os.getenv("FOOTVERSE_AGENT_MODEL", "gpt-4o-mini")
 MEMORY_DIR: str | None = os.getenv("FOOTVERSE_MEMORY_DIR")
+AGENT_MAX_STEPS: int = int(os.getenv("FOOTVERSE_AGENT_MAX_STEPS", "20"))
 
 _PERSONALIDADES: dict[str, str] = {
     "agressivo": (
@@ -124,13 +133,31 @@ class ClubManager:
         return create_agent(llm, tools, system_prompt=prompt)
 
     def _run(self, club_id: str, personalidade: str) -> str:
+        from langgraph.errors import GraphRecursionError
+
         graph = self._build_graph(club_id, personalidade)
         callbacks = [AgentLogger("manager", club_id)] if AgentLogger is not None else []
+        config: dict = {"recursion_limit": AGENT_MAX_STEPS}
+        if callbacks:
+            config["callbacks"] = callbacks
         t0 = time.perf_counter()
-        result = graph.invoke(
-            {"messages": [("human", "É a sua vez de gerenciar o clube nesta rodada.")]},
-            config={"callbacks": callbacks} if callbacks else {},
-        )
+        try:
+            result = graph.invoke(
+                {"messages": [("human", "É a sua vez de gerenciar o clube nesta rodada.")]},
+                config=config,
+            )
+        except GraphRecursionError:
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            tools_called = callbacks[0].tools_called if callbacks else []
+            logger.warning(
+                "ai_manager_step_limit",
+                extra={"club_id": club_id, "tools_called": tools_called, "ms": ms,
+                      "limit": AGENT_MAX_STEPS},
+            )
+            return (
+                f"Limite de {AGENT_MAX_STEPS} passos atingido nesta rodada — "
+                "as ações já executadas até aqui foram mantidas."
+            )
         ms = round((time.perf_counter() - t0) * 1000, 1)
         tools_called = callbacks[0].tools_called if callbacks else []
         logger.info(

@@ -139,6 +139,48 @@ def test_advisor_build_graph_nao_quebra(monkeypatch):
     assert graph is not None
 
 
+# ── limite de passos por decisão (controle de custo) ────────────────────────
+class _ConfigCapturingGraph:
+    def __init__(self):
+        self.received_config: dict | None = None
+
+    def invoke(self, input, config=None):
+        self.received_config = config
+        return {"messages": [type("M", (), {"content": "ok"})()]}
+
+
+class _RecursionErrorGraph:
+    def invoke(self, input, config=None):
+        from langgraph.errors import GraphRecursionError
+        raise GraphRecursionError("limite de passos excedido")
+
+
+def test_advisor_aplica_recursion_limit(monkeypatch):
+    from footverse.agents import advisor as advisor_module
+
+    world, cid = _world_com_clube()
+    adv = advisor_module.Advisor(world)
+    fake_graph = _ConfigCapturingGraph()
+    monkeypatch.setattr(adv, "_build_graph", lambda *a, **k: fake_graph)
+
+    adv.scout(cid, "Quem devo comprar?")
+
+    assert fake_graph.received_config is not None
+    assert fake_graph.received_config["recursion_limit"] == advisor_module.AGENT_MAX_STEPS
+
+
+def test_advisor_trata_limite_excedido_sem_propagar_excecao(monkeypatch):
+    from footverse.agents import advisor as advisor_module
+
+    world, cid = _world_com_clube()
+    adv = advisor_module.Advisor(world)
+    monkeypatch.setattr(adv, "_build_graph", lambda *a, **k: _RecursionErrorGraph())
+
+    resposta = adv.scout(cid, "Quem devo comprar?")  # não deve lançar
+    assert isinstance(resposta, str)
+    assert len(resposta) > 0
+
+
 # ── testes do Advisor (LLM mockado) ──────────────────────────────────────────
 
 def test_advisor_scout_com_run_mockado():

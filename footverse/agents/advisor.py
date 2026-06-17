@@ -25,6 +25,7 @@ logger = logging.getLogger("footverse.agents")
 
 AGENT_MODEL: str = os.getenv("FOOTVERSE_AGENT_MODEL", "gpt-4o-mini")
 MEMORY_DIR: str | None = os.getenv("FOOTVERSE_MEMORY_DIR")
+AGENT_MAX_STEPS: int = int(os.getenv("FOOTVERSE_AGENT_MAX_STEPS", "20"))
 
 # ── Prompts de sistema ────────────────────────────────────────────────────────
 
@@ -116,13 +117,23 @@ class Advisor:
         return create_agent(llm, tools, system_prompt=system_prompt)
 
     def _run(self, system_prompt: str, club_id: str, pergunta: str, agente: str = "?") -> str:
+        from langgraph.errors import GraphRecursionError
+
         graph = self._build_graph(system_prompt, club_id)
         callbacks = [AgentLogger(agente, club_id)] if AgentLogger is not None else []
+        config: dict = {"recursion_limit": AGENT_MAX_STEPS}
+        if callbacks:
+            config["callbacks"] = callbacks
         t0 = time.perf_counter()
-        result = graph.invoke(
-            {"messages": [("human", pergunta)]},
-            config={"callbacks": callbacks} if callbacks else {},
-        )
+        try:
+            result = graph.invoke({"messages": [("human", pergunta)]}, config=config)
+        except GraphRecursionError:
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            logger.warning(
+                "agent_step_limit",
+                extra={"agente": agente, "club_id": club_id, "ms": ms, "limit": AGENT_MAX_STEPS},
+            )
+            return "Não consegui concluir a análise dentro do limite de passos. Tente reformular a pergunta."
         ms = round((time.perf_counter() - t0) * 1000, 1)
         tools_called = callbacks[0].tools_called if callbacks else []
         logger.info(
