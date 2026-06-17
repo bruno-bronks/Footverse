@@ -8,6 +8,7 @@ casca fina sobre isto; testes podem exercer o loop sem subir servidor.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -71,6 +72,12 @@ class World:
         # Fase 4: gerente de IA dos clubes autônomos. None = lazy import real
         # (agents.manager.ClubManager); injetável para testes sem chamar LLM.
         self._ai_manager = ai_manager
+        # serializa mutações de estado (comprar/escalar/vender/pontuar) quando
+        # vários clubes de IA decidem em paralelo (ver tick()); o "pensar"
+        # (chamada ao LLM) fica concorrente, só o "agir" é exclusivo.
+        self._state_lock = threading.Lock()
+        # previne dois tick() concorrentes processarem a mesma rodada
+        self._tick_lock = threading.Lock()
 
     # ── ações do loop ──────────────────────────────────────────────────────
     def criar_clube(self, user_id: str, nome: str, cores: list[str],
@@ -101,50 +108,56 @@ class World:
         return club
 
     def comprar(self, club_id: str, player_id: str) -> CompraResult:
-        return comprar_jogador(self.store, club_id, player_id)
+        with self._state_lock:
+            return comprar_jogador(self.store, club_id, player_id)
 
     def listar_venda(self, club_id: str, player_id: str, preco_fvs: int) -> ListingResult:
-        return listar_jogador(self.store, club_id, player_id, preco_fvs)
+        with self._state_lock:
+            return listar_jogador(self.store, club_id, player_id, preco_fvs)
 
     def cancelar_venda(self, club_id: str, player_id: str) -> None:
-        cancelar_listagem(self.store, club_id, player_id)
+        with self._state_lock:
+            cancelar_listagem(self.store, club_id, player_id)
 
     def escalar(self, club_id: str, formacao: str,
                 titulares: list[tuple[str, str]], reservas: list[str]) -> Lineup:
-        self._require_club(club_id)
-        squad = self._squad(club_id)
-        lineup = validate_lineup(formacao, titulares, reservas, squad)
-        self.lineups[club_id] = lineup
-        self.store.save_lineup(club_id, lineup)
-        return lineup
+        with self._state_lock:
+            self._require_club(club_id)
+            squad = self._squad(club_id)
+            lineup = validate_lineup(formacao, titulares, reservas, squad)
+            self.lineups[club_id] = lineup
+            self.store.save_lineup(club_id, lineup)
+            return lineup
 
     def pontuar(self, club_id: str, rodada_id: str) -> RoundScore:
-        self._require_club(club_id)
-        lineup = self.lineups.get(club_id) or self.store.get_lineup(club_id)
-        if lineup is None:
-            raise LineupError(NO_VALID_LINEUP, "clube sem escalação ativa")
-        self.lineups[club_id] = lineup   # popula cache se veio do store
-        squad = self._squad(club_id)
-        slots = [TitularSlot(squad[pid], slot) for pid, slot in lineup.titulares]
-        club = self._require_club(club_id)
-        rs = score_round(slots, club.divisao, self.season_secret, club_id, rodada_id)
-        registrar_rodada(self.store, self._get_season(club_id), rodada_id, rs.pontos_centi)
-        return rs
+        with self._state_lock:
+            self._require_club(club_id)
+            lineup = self.lineups.get(club_id) or self.store.get_lineup(club_id)
+            if lineup is None:
+                raise LineupError(NO_VALID_LINEUP, "clube sem escalação ativa")
+            self.lineups[club_id] = lineup   # popula cache se veio do store
+            squad = self._squad(club_id)
+            slots = [TitularSlot(squad[pid], slot) for pid, slot in lineup.titulares]
+            club = self._require_club(club_id)
+            rs = score_round(slots, club.divisao, self.season_secret, club_id, rodada_id)
+            registrar_rodada(self.store, self._get_season(club_id), rodada_id, rs.pontos_centi)
+            return rs
 
     def encerrar(self, club_id: str) -> SeasonResult:
-        self._require_club(club_id)
-        season = self._get_season(club_id)
-        resultado = encerrar_temporada(self.store, season)
-        # rollover atômico (SPEC-006 §4.6-4.7): forma nova + próxima temporada
-        nova = proxima_temporada(self.store, season)
-        atualizar_forma_elenco(self.store, self.season_secret, club_id, nova.temporada)
-        self.seasons[club_id] = nova
-        self.store.save_season(nova)
-        self.lineups.pop(club_id, None)
-        self.store.delete_lineup(club_id)
-        # reabastece o mercado para a próxima temporada
-        self.refresh_market(nova.temporada)
-        return resultado
+        with self._state_lock:
+            self._require_club(club_id)
+            season = self._get_season(club_id)
+            resultado = encerrar_temporada(self.store, season)
+            # rollover atômico (SPEC-006 §4.6-4.7): forma nova + próxima temporada
+            nova = proxima_temporada(self.store, season)
+            atualizar_forma_elenco(self.store, self.season_secret, club_id, nova.temporada)
+            self.seasons[club_id] = nova
+            self.store.save_season(nova)
+            self.lineups.pop(club_id, None)
+            self.store.delete_lineup(club_id)
+            # reabastece o mercado para a próxima temporada
+            self.refresh_market(nova.temporada)
+            return resultado
 
     def refresh_market(self, temporada: int) -> int:
         """Gera 50 novos jogadores para o mercado e os adiciona ao catálogo.
@@ -184,6 +197,20 @@ class World:
             )
             return None
 
+    def _run_ai_managers_parallel(self, club_ids: list[str], max_workers: int = 8) -> None:
+        """Roda `run_ai_manager` para vários clubes em paralelo (threads).
+
+        Cada chamada é I/O-bound (chamada de rede ao LLM, pode levar segundos
+        a minutos com retries de rate limit). Paralelizar reduz o tempo total
+        de N×latência para ~1×latência. As mutações de estado que cada agente
+        provoca (comprar/escalar/vender) continuam serializadas por
+        `_state_lock` dentro de cada método — só o "pensar" é concorrente.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(max_workers, len(club_ids))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(self.run_ai_manager, club_ids))
+
     # ── relógio de mundo (Fase 3) ───────────────────────────────────────────
     def tick(self, now: float | None = None) -> TickResult:
         """Avança o mundo em uma rodada, se `ROUND_DURATION_SECONDS` já passou.
@@ -192,43 +219,67 @@ class World:
         escalação salva, ou 0 pontos se não houver) e encerra temporadas que
         completarem RODADAS_POR_TEMPORADA. Idempotente dentro da janela: chamar
         de novo antes do intervalo configurado não tem efeito.
+
+        Os clubes de IA decidem em paralelo (thread pool) antes da pontuação
+        — ver `_run_ai_managers_parallel`. Chame esta função via
+        `asyncio.to_thread` no lado da API para não bloquear o event loop
+        enquanto os agentes de IA "pensam" (ver app.py).
         """
         now = now if now is not None else time.time()
-        last = self.store.get_last_tick_at()
-        if last is not None and (now - float(last)) < ROUND_DURATION_SECONDS:
-            return TickResult(advanced=False,
-                              next_tick_in=ROUND_DURATION_SECONDS - (now - float(last)))
+        if not self._tick_lock.acquire(blocking=False):
+            # já existe um tick em andamento (ex.: chamada concorrente) — não
+            # reprocessa a mesma rodada duas vezes.
+            last = self.store.get_last_tick_at()
+            next_in = max(0.0, ROUND_DURATION_SECONDS - (now - float(last))) if last else 0.0
+            return TickResult(advanced=False, next_tick_in=next_in)
+        try:
+            last = self.store.get_last_tick_at()
+            if last is not None and (now - float(last)) < ROUND_DURATION_SECONDS:
+                return TickResult(advanced=False,
+                                  next_tick_in=ROUND_DURATION_SECONDS - (now - float(last)))
 
-        eventos: list[TickEvent] = []
-        for club_id in self.store.all_active_club_ids():
-            stored_season = self.store.get_season(club_id)
-            if stored_season is None or stored_season.status != "EM_ANDAMENTO":
-                continue
+            active_clubs: list[str] = []
+            ai_clubs: list[str] = []
+            for club_id in self.store.all_active_club_ids():
+                stored_season = self.store.get_season(club_id)
+                if stored_season is None or stored_season.status != "EM_ANDAMENTO":
+                    continue
+                active_clubs.append(club_id)
+                club = self.store.get_club(club_id)
+                if club is not None and club.gerenciado_por_ia:
+                    ai_clubs.append(club_id)
 
-            club = self.store.get_club(club_id)
-            if club is not None and club.gerenciado_por_ia:
-                self.run_ai_manager(club_id)   # pode comprar/vender/escalar antes da rodada
+            # Fase 1: decisões de IA em paralelo (pode comprar/vender/escalar
+            # antes da rodada). Bloqueante para quem chamou tick(), mas não
+            # mais lento que o pior caso de uma única decisão.
+            if ai_clubs:
+                self._run_ai_managers_parallel(ai_clubs)
 
-            season = self._get_season(club_id)
-            rodada_idx = season.rodada_atual + 1
-            rodada_id = f"auto_T{season.temporada}_R{rodada_idx}"
+            # Fase 2: pontuação — determinística e rápida, roda sequencial.
+            eventos: list[TickEvent] = []
+            for club_id in active_clubs:
+                season = self._get_season(club_id)
+                rodada_idx = season.rodada_atual + 1
+                rodada_id = f"auto_T{season.temporada}_R{rodada_idx}"
 
-            lineup = self.lineups.get(club_id) or self.store.get_lineup(club_id)
-            if lineup is not None:
-                rs = self.pontuar(club_id, rodada_id)
-                pontos = rs.pontos_centi / 100
-            else:
-                registrar_rodada(self.store, season, rodada_id, 0)
-                pontos = 0.0
-            eventos.append(TickEvent(club_id, "RODADA", rodada_id, pontos))
+                lineup = self.lineups.get(club_id) or self.store.get_lineup(club_id)
+                if lineup is not None:
+                    rs = self.pontuar(club_id, rodada_id)
+                    pontos = rs.pontos_centi / 100
+                else:
+                    registrar_rodada(self.store, season, rodada_id, 0)
+                    pontos = 0.0
+                eventos.append(TickEvent(club_id, "RODADA", rodada_id, pontos))
 
-            if self._get_season(club_id).rodada_atual >= config.RODADAS_POR_TEMPORADA:
-                resultado = self.encerrar(club_id)
-                eventos.append(TickEvent(club_id, "TEMPORADA_ENCERRADA",
-                                         resultado=resultado.resultado))
+                if self._get_season(club_id).rodada_atual >= config.RODADAS_POR_TEMPORADA:
+                    resultado = self.encerrar(club_id)
+                    eventos.append(TickEvent(club_id, "TEMPORADA_ENCERRADA",
+                                             resultado=resultado.resultado))
 
-        self.store.set_last_tick_at(str(now))
-        return TickResult(advanced=True, eventos=eventos, next_tick_in=float(ROUND_DURATION_SECONDS))
+            self.store.set_last_tick_at(str(now))
+            return TickResult(advanced=True, eventos=eventos, next_tick_in=float(ROUND_DURATION_SECONDS))
+        finally:
+            self._tick_lock.release()
 
     def clock_status(self) -> dict:
         last = self.store.get_last_tick_at()

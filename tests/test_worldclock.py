@@ -187,3 +187,102 @@ def test_publish_tick_events_alcanca_assinante():
     assert payload["club_id"] == "club_1"
     assert payload["tipo"] == "RODADA"
     assert payload["pontos"] == 10.0
+
+
+# ── concorrência: clubes de IA em paralelo, sem travar nem corromper estado ──
+# Achado em teste manual real: com 3 clubes de IA, a API ficou ~6min
+# inacessível (uma chamada GET / trivial levou 237s) porque tick() processava
+# os agentes um por um, de forma síncrona, no mesmo event loop que atende toda
+# a API. A correção: World._run_ai_managers_parallel roda os agentes em
+# threads (I/O-bound — só esperam rede), e World._state_lock serializa as
+# mutações de estado que cada agente provoca (comprar/escalar/vender), já que
+# múltiplas threads podem chamá-las ao mesmo tempo.
+
+import threading
+import time
+
+
+class _SlowFakeManager:
+    """Simula uma decisão de IA que demora — sem chamar LLM de verdade."""
+
+    def __init__(self, delay: float = 0.2):
+        self.delay = delay
+        self.calls: list[str] = []
+        self._lock = threading.Lock()
+
+    def decide(self, club_id: str) -> str:
+        time.sleep(self.delay)
+        with self._lock:
+            self.calls.append(club_id)
+        return "ok"
+
+
+def test_tick_processa_clubes_de_ia_em_paralelo_nao_sequencial():
+    """N clubes de IA devem levar ~1 atraso, não N atrasos (prova o fix)."""
+    delay = 0.25
+    fake = _SlowFakeManager(delay=delay)
+    world = World("PARALLEL_TEST", ai_manager=fake)
+    n = 4
+    for i in range(n):
+        world.criar_clube_ia(f"Robot {i}", _CORES)
+
+    t0 = time.perf_counter()
+    result = world.tick(now=1000.0)
+    elapsed = time.perf_counter() - t0
+
+    assert result.advanced is True
+    assert len(fake.calls) == n
+    # sequencial seria ~n*delay; em paralelo deve ficar bem abaixo disso
+    assert elapsed < (n * delay) * 0.7, (
+        f"tick levou {elapsed:.2f}s para {n} clubes — parece sequencial, não paralelo"
+    )
+
+
+def test_state_lock_previne_compra_dupla_concorrente():
+    """Duas threads comprando o mesmo jogador ao mesmo tempo — só uma vence."""
+    from footverse.state.economy import EconomyError
+
+    world = World("RACE_TEST")
+    club_a = world.criar_clube_ia("Robot A", _CORES)
+    club_b = world.criar_clube_ia("Robot B", _CORES)
+    pid = world.mercado_disponivel()[0].player.id
+
+    resultados: dict[str, str] = {}
+
+    def comprar(club_id: str) -> None:
+        try:
+            world.comprar(club_id, pid)
+            resultados[club_id] = "ok"
+        except EconomyError as e:
+            resultados[club_id] = e.code
+
+    t1 = threading.Thread(target=comprar, args=(club_a.id,))
+    t2 = threading.Thread(target=comprar, args=(club_b.id,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    sucessos = [v for v in resultados.values() if v == "ok"]
+    assert len(sucessos) == 1, f"esperado exatamente 1 sucesso, veio {resultados}"
+    # o jogador deve pertencer a exatamente um dos dois clubes
+    dono = world.store.owner_of(pid)
+    assert dono in (club_a.id, club_b.id)
+
+
+def test_tick_continua_funcionando_com_lock_apos_clube_de_ia_falhar():
+    """Lock não fica preso se um agente lança exceção — fluxo normal segue."""
+    class FlakyManager:
+        def decide(self, club_id: str) -> str:
+            raise RuntimeError("boom")
+
+    world = World("LOCK_RELEASE_TEST", ai_manager=FlakyManager())
+    club = world.criar_clube_ia("Robot Flaky", _CORES)
+
+    result = world.tick(now=1000.0)
+    assert result.advanced is True
+
+    # confirma que o _state_lock foi liberado corretamente (não ficou preso)
+    acquired = world._state_lock.acquire(blocking=False)
+    assert acquired, "_state_lock ficou travado após exceção no agente de IA"
+    world._state_lock.release()

@@ -59,6 +59,31 @@ Get-NetTCPConnection -LocalPort 8000,5173 -ErrorAction SilentlyContinue |
   ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
 ```
 
+⚠️ **The PID reported by `Get-NetTCPConnection`/`netstat -ano` for port 8000 can be
+stale or wrong** in this environment (observed: netstat said PID 27424, but that
+PID didn't exist for `taskkill`/`Get-Process` — the actual process was a
+different PID entirely). If `Stop-Process` silently does nothing and the port
+is still bound after a "kill", match by command line instead, which is
+reliable:
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+  Where-Object { $_.CommandLine -match 'uvicorn' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+```
+(Don't put the literal word "uvicorn" in a `-Filter` WQL string that also
+contains the wrapping PowerShell command itself, e.g. via `-Command "...uvicorn..."`
+— it'll match and kill the wrapper process that's running your *own* kill
+command. Filter on `Name = 'python.exe'` first, then `Where-Object` on
+`CommandLine` separately, as above.)
+
+Always verify a restart actually bound before proceeding:
+```bash
+grep -q "Uvicorn running on" server.log && echo "BIND OK" || echo "BIND FAILED — check server.log"
+```
+`Application startup complete` can appear in the log even when the actual
+socket bind fails right after (address already in use) — only "Uvicorn
+running on http://..." proves the new process is the one actually serving.
+
 ## State is in-memory and shared across requests
 
 `World` (in-memory `Store`) lives for the lifetime of the backend process. The
@@ -107,6 +132,36 @@ with sync_playwright() as p:
     print("console errors:", errors or "none")
     browser.close()
 ```
+
+## Testing AI clubs (Fase 4) for real
+
+`POST /admin/ai-clubs` creates one, `POST /admin/clubs/{id}/run-ai` forces a
+real decision (real OpenAI call — costs tokens, takes 10s to a few minutes
+depending on rate limits). `POST /admin/tick` processes ALL AI clubs with an
+active season at once (in parallel — see below).
+
+**The OpenAI account's TPM (tokens-per-minute) rate limit accumulates across
+an entire session.** Repeated testing in the same conversation can exhaust a
+small-tier key's budget (observed: 200,000 TPM limit hit after a handful of
+test runs), after which every decision fails with `RateLimitError` until the
+window resets (~1 minute, but retries with backoff can make a single decision
+take several minutes before giving up). A failed decision is not a bug — the
+club just scores 0 that round (DESIGN_DOC §4: "if the AI falls, the game
+continues"). Don't burn more real calls chasing a "successful" decision once
+you've already proven the integration works once — check `tools_called` in
+the structured log instead of insisting on a clean run.
+
+**Concurrency**: `World.tick()` runs all AI clubs' decisions in parallel via a
+thread pool (`_run_ai_managers_parallel`), and the API offloads `tick()` itself
+to a worker thread (`asyncio.to_thread`) so the event loop stays responsive
+while agents are "thinking." This was *not* always true — see
+`test_tick_processa_clubes_de_ia_em_paralelo_nao_sequencial` and
+`test_state_lock_previne_compra_dupla_concorrente` in
+`tests/test_worldclock.py` for what regressions to watch for if touching
+`World.tick`/`run_ai_manager`/`_state_lock`. Empirically measured before the
+fix: 3 AI clubs ticking made a trivial `GET /` wait **237 seconds** because
+the whole event loop was blocked; after the fix, worst-case latency during the
+same scenario was under 0.5s.
 
 ### Gotchas hit while writing this
 

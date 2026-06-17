@@ -100,7 +100,10 @@ def create_app(world: World | None = None) -> FastAPI:
             while True:
                 await asyncio.sleep(_clock_check_interval)
                 try:
-                    result = app.state.world.tick()
+                    # tick() pode bloquear por minutos (decisões de IA via
+                    # LLM) — roda numa thread separada para não congelar o
+                    # event loop e travar toda a API enquanto isso.
+                    result = await asyncio.to_thread(app.state.world.tick)
                     _publish_tick_events(app.state, result)
                 except Exception:
                     logging.getLogger("footverse").exception("erro no relógio de mundo")
@@ -177,8 +180,12 @@ def create_app(world: World | None = None) -> FastAPI:
     # ── relógio de mundo (Fase 3) ───────────────────────────────────────────
     @app.post("/admin/tick")
     async def admin_tick(request: Request) -> dict:
-        """Força uma checagem do relógio — avança se o intervalo já passou."""
-        result = _w(request).tick()
+        """Força uma checagem do relógio — avança se o intervalo já passou.
+
+        Roda em thread separada: pode levar minutos se houver clubes de IA
+        decidindo, e isso não deve travar o resto da API nesse meio-tempo.
+        """
+        result = await asyncio.to_thread(_w(request).tick)
         _publish_tick_events(request.app.state, result)
         return {
             "advanced": result.advanced,
