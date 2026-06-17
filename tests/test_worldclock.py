@@ -238,6 +238,31 @@ def test_tick_processa_clubes_de_ia_em_paralelo_nao_sequencial():
     )
 
 
+def test_tick_escala_para_dezenas_de_clubes_de_ia():
+    """Regressão de escala: o speedup deve se manter com muito mais clubes
+    (achado real: a versão sem paralelismo travava a API com só 3 clubes —
+    ver SKILL.md run-footverse). Usa fakes — não gasta tokens de LLM."""
+    delay = 0.2
+    n = 30
+    fake = _SlowFakeManager(delay=delay)
+    world = World("SCALE_TEST", ai_manager=fake)
+    for i in range(n):
+        world.criar_clube_ia(f"Robot {i}", _CORES)
+
+    t0 = time.perf_counter()
+    result = world.tick(now=1000.0)
+    elapsed = time.perf_counter() - t0
+
+    assert result.advanced is True
+    assert len(fake.calls) == n
+    sequencial_estimado = n * delay
+    # com o pool de threads, esperado pelo menos ~4x mais rápido que sequencial
+    assert elapsed < sequencial_estimado / 4, (
+        f"tick levou {elapsed:.2f}s para {n} clubes (sequencial seria "
+        f"~{sequencial_estimado:.2f}s) — especificidade de escala não se sustentou"
+    )
+
+
 def test_state_lock_previne_compra_dupla_concorrente():
     """Duas threads comprando o mesmo jogador ao mesmo tempo — só uma vence."""
     from footverse.state.economy import EconomyError
