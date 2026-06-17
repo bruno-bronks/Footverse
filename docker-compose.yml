@@ -1,0 +1,33 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////data/footverse.db}
+      - FOOTVERSE_SEASON_SECRET=${FOOTVERSE_SEASON_SECRET:-FOOTVERSE_S1}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5173,http://localhost:8000}
+      - ROUND_DURATION_SECONDS=${ROUND_DURATION_SECONDS:-86400}
+      - CLOCK_CHECK_INTERVAL_SECONDS=${CLOCK_CHECK_INTERVAL_SECONDS:-60}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      - fv_data:/data
+    restart: unless-stopped
+
+  # Opcional: Postgres em vez de SQLite
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_DB: footverse
+  #     POSTGRES_USER: fv
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fv_dev}
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U fv"]
+  #     interval: 5s
+  #     retries: 5
+
+volumes:
+  fv_data:
+  # pg_data:
