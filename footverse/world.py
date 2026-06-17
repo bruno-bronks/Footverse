@@ -47,10 +47,13 @@ ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", "86400"))
 @dataclass(frozen=True)
 class TickEvent:
     club_id: str
-    tipo: str                       # "RODADA" | "TEMPORADA_ENCERRADA"
+    tipo: str                       # RODADA | TEMPORADA_ENCERRADA | DECISAO_IA |
+                                     # PERSONALIDADE | TRANSFERENCIA_P2P | FUNDACAO
     rodada_id: str | None = None
     pontos: float | None = None
     resultado: str | None = None    # preenchido em TEMPORADA_ENCERRADA
+    texto: str | None = None        # narrativa legível (feed de notícias)
+    ts: float = field(default_factory=time.time)
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,19 @@ class TickResult:
     advanced: bool
     eventos: list[TickEvent] = field(default_factory=list)
     next_tick_in: float = 0.0
+
+
+# personalidade evolui com o resultado da temporada — um clube de IA não é
+# estático, reage ao que viveu (a tese de "narrativa emergente" do
+# DESIGN_DOC precisa de personagens que mudam, não só decidem sempre igual).
+_PERSONALIDADE_POS_TEMPORADA: dict[str, str] = {
+    "REBAIXADO": "agressivo",     # desespero — precisa reforçar pra voltar
+    "CAMPEAO": "conservador",     # protege o time campeão, não arrisca
+    "PROMOVIDO": "equilibrado",   # cautela na divisão nova, mais forte
+    # "PERMANECE": sem entrada — mantém a personalidade atual
+}
+
+_NEWS_MAX = 200  # tamanho máximo do feed de notícias em memória
 
 
 class World:
@@ -78,6 +94,22 @@ class World:
         self._state_lock = threading.Lock()
         # previne dois tick() concorrentes processarem a mesma rodada
         self._tick_lock = threading.Lock()
+        # feed de notícias (Fase 4): histórico rolante de eventos narrativos
+        # (decisão de IA, mudança de personalidade, transferência P2P,
+        # encerramento de temporada) — não inclui pontuação rotineira de
+        # rodada, que já é visível no dashboard/standings.
+        self._news: list[TickEvent] = []
+
+    def _add_news(self, event: TickEvent) -> TickEvent:
+        self._news.append(event)
+        if len(self._news) > _NEWS_MAX:
+            del self._news[: len(self._news) - _NEWS_MAX]
+        return event
+
+    def news(self, club_id: str | None = None, limit: int = 20) -> list[TickEvent]:
+        """Feed de notícias, mais recente primeiro. Filtra por clube se informado."""
+        items = self._news if club_id is None else [n for n in self._news if n.club_id == club_id]
+        return list(reversed(items[-limit:]))
 
     # ── ações do loop ──────────────────────────────────────────────────────
     def criar_clube(self, user_id: str, nome: str, cores: list[str],
@@ -105,11 +137,25 @@ class World:
         club.gerenciado_por_ia = True
         club.ia_personalidade = personalidade
         self.store.save_club(club)
+        self._add_news(TickEvent(
+            club.id, "FUNDACAO",
+            texto=f"{club.nome} entra na {club.divisao}, gerenciado por IA ({personalidade}).",
+        ))
         return club
 
     def comprar(self, club_id: str, player_id: str) -> CompraResult:
         with self._state_lock:
-            return comprar_jogador(self.store, club_id, player_id)
+            result = comprar_jogador(self.store, club_id, player_id)
+            if result.tipo == "P2P" and result.vendedor_club_id:
+                comprador = self.store.get_club(club_id)
+                vendedor = self.store.get_club(result.vendedor_club_id)
+                if comprador is not None and vendedor is not None:
+                    self._add_news(TickEvent(
+                        club_id, "TRANSFERENCIA_P2P",
+                        texto=(f"{comprador.nome} comprou um jogador de {vendedor.nome} "
+                              f"por FV${result.valor_fvs:,}."),
+                    ))
+            return result
 
     def listar_venda(self, club_id: str, player_id: str, preco_fvs: int) -> ListingResult:
         with self._state_lock:
@@ -145,9 +191,32 @@ class World:
 
     def encerrar(self, club_id: str) -> SeasonResult:
         with self._state_lock:
-            self._require_club(club_id)
+            club = self._require_club(club_id)
             season = self._get_season(club_id)
             resultado = encerrar_temporada(self.store, season)
+
+            self._add_news(TickEvent(
+                club_id, "TEMPORADA_ENCERRADA", resultado=resultado.resultado,
+                texto=(f"{club.nome}: temporada {resultado.temporada} encerrada — "
+                      f"{resultado.resultado} ({resultado.divisao_anterior} → "
+                      f"{resultado.divisao_nova})."),
+            ))
+
+            # Fase 4: personalidade evolui com o resultado — clube de IA reage
+            # ao que viveu, não decide sempre do mesmo jeito (ver
+            # _PERSONALIDADE_POS_TEMPORADA).
+            if club.gerenciado_por_ia:
+                nova_personalidade = _PERSONALIDADE_POS_TEMPORADA.get(resultado.resultado)
+                if nova_personalidade and nova_personalidade != club.ia_personalidade:
+                    antiga = club.ia_personalidade
+                    club.ia_personalidade = nova_personalidade
+                    self.store.save_club(club)
+                    self._add_news(TickEvent(
+                        club_id, "PERSONALIDADE",
+                        texto=(f"{club.nome} muda de postura após {resultado.resultado.lower()}: "
+                              f"{antiga} → {nova_personalidade}."),
+                    ))
+
             # rollover atômico (SPEC-006 §4.6-4.7): forma nova + próxima temporada
             nova = proxima_temporada(self.store, season)
             atualizar_forma_elenco(self.store, self.season_secret, club_id, nova.temporada)
@@ -189,7 +258,12 @@ class World:
             except ImportError:
                 return None
         try:
-            return self._ai_manager.decide(club_id)
+            resultado = self._ai_manager.decide(club_id)
+            if resultado:
+                club = self.store.get_club(club_id)
+                nome = club.nome if club is not None else club_id
+                self._add_news(TickEvent(club_id, "DECISAO_IA", texto=f"{nome}: {resultado}"))
+            return resultado
         except Exception:
             import logging
             logging.getLogger("footverse").exception(

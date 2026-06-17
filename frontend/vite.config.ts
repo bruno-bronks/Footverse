@@ -10,6 +10,7 @@ export default defineConfig({
       '/auth': 'http://localhost:8000',
       '/divisions': 'http://localhost:8000',
       '/admin': 'http://localhost:8000',
+      '/news': 'http://localhost:8000',
     },
   },
   build: {

@@ -91,6 +91,21 @@ export const api = {
   // ── Relógio de mundo (Fase 3) ───────────────────────────────────────────────
   getClockStatus: () =>
     get<ClockStatus>('/admin/clock'),
+
+  // ── Feed de notícias (Fase 4) ────────────────────────────────────────────────
+  getNews: (clubId?: string, limit = 20) => {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (clubId) params.set('club_id', clubId)
+    return get<NewsItem[]>(`/news?${params.toString()}`)
+  },
+}
+
+export interface NewsItem {
+  ts: number
+  club_id: string
+  tipo: 'RODADA' | 'TEMPORADA_ENCERRADA' | 'DECISAO_IA' | 'PERSONALIDADE' | 'TRANSFERENCIA_P2P' | 'FUNDACAO'
+  texto: string | null
+  resultado: string | null
 }
 
 export interface ClockStatus {

@@ -42,6 +42,7 @@ from .schemas import (
     ListarVendaIn,
     ListingOut,
     MarketPlayerOut,
+    NewsItemOut,
     PerguntaIn,
     RegisterIn,
     RoundOut,
@@ -260,6 +261,16 @@ def create_app(world: World | None = None) -> FastAPI:
     def standings(divisao: str, request: Request) -> list[StandingEntryOut]:
         rows = _w(request).standings(divisao)
         return [StandingEntryOut(**row) for row in rows]
+
+    @app.get("/news", response_model=list[NewsItemOut])
+    def get_news(request: Request, club_id: str | None = None, limit: int = 20) -> list[NewsItemOut]:
+        """Feed de notícias: decisões de IA, mudanças de personalidade,
+        transferências P2P e encerramentos de temporada. Mais recente primeiro."""
+        eventos = _w(request).news(club_id=club_id, limit=limit)
+        return [
+            NewsItemOut(ts=e.ts, club_id=e.club_id, tipo=e.tipo, texto=e.texto, resultado=e.resultado)
+            for e in eventos
+        ]
 
     @app.get("/clubs/{club_id}", response_model=ClubeOut)
     def get_club(club_id: str, request: Request) -> ClubeOut:

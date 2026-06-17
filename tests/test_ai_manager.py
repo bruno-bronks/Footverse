@@ -386,3 +386,175 @@ def test_admin_run_ai_now_sem_agents_503(client_factory):
     with patch.dict("sys.modules", {"footverse.agents.manager": None}):
         r = client.post(f"/admin/clubs/{club.id}/run-ai")
     assert r.status_code == 503
+
+
+# ── feed de notícias e evolução de personalidade ────────────────────────────
+from footverse import config
+from footverse.state.season import registrar_rodada
+
+
+def _force_season_result(world: World, club_id: str, pontos_centi_por_rodada: int):
+    """Joga as RODADAS_POR_TEMPORADA com pontuação fixa e encerra a temporada,
+    sem precisar montar elenco/escalação real."""
+    season = world._get_season(club_id)
+    for i in range(config.RODADAS_POR_TEMPORADA):
+        registrar_rodada(world.store, season, f"rod_{i}", pontos_centi_por_rodada)
+    return world.encerrar(club_id)
+
+
+def test_criar_clube_ia_gera_noticia_de_fundacao():
+    world = World("NEWS_TEST")
+    club = world.criar_clube_ia("Robot FC", _CORES, personalidade="agressivo")
+    noticias = world.news(club_id=club.id)
+    assert len(noticias) == 1
+    assert noticias[0].tipo == "FUNDACAO"
+    assert "Robot FC" in noticias[0].texto
+
+
+def test_run_ai_manager_gera_noticia_quando_decide():
+    fake = FakeManager(resultado="Comprei 3 jogadores.")
+    world = World("NEWS_TEST2", ai_manager=fake)
+    club = world.criar_clube_ia("Robot FC", _CORES)
+    world.run_ai_manager(club.id)
+
+    noticias = world.news(club_id=club.id)
+    tipos = [n.tipo for n in noticias]
+    assert "DECISAO_IA" in tipos
+    decisao = next(n for n in noticias if n.tipo == "DECISAO_IA")
+    assert "Comprei 3 jogadores" in decisao.texto
+
+
+def test_run_ai_manager_nao_gera_noticia_se_falhar():
+    fake = FakeManager(excecao=RuntimeError("boom"))
+    world = World("NEWS_TEST3", ai_manager=fake)
+    club = world.criar_clube_ia("Robot FC", _CORES)
+    world.run_ai_manager(club.id)
+
+    tipos = [n.tipo for n in world.news(club_id=club.id)]
+    assert "DECISAO_IA" not in tipos
+
+
+def test_encerrar_gera_noticia_de_temporada():
+    world = World("NEWS_TEST4")
+    club = world.criar_clube("u1", "Clube Humano", _CORES)
+    _force_season_result(world, club.id, 0)  # PERMANECE (não é o pior de SERIE_D)
+
+    noticias = world.news(club_id=club.id)
+    tipos = [n.tipo for n in noticias]
+    assert "TEMPORADA_ENCERRADA" in tipos
+
+
+def test_personalidade_evolui_apos_rebaixamento():
+    world = World("NEWS_TEST5")
+    club = world.criar_clube_ia("Robot FC", _CORES, personalidade="conservador")
+    club.divisao = "SERIE_C"  # precisa de divisão abaixo pra poder cair
+    world.store.save_club(club)
+    world.seasons[club.id].divisao = "SERIE_C"
+
+    resultado = _force_season_result(world, club.id, 0)  # último lugar -> rebaixa
+
+    assert resultado.resultado == "REBAIXADO"
+    atualizado = world.store.get_club(club.id)
+    assert atualizado.ia_personalidade == "agressivo"
+
+    tipos = [n.tipo for n in world.news(club_id=club.id)]
+    assert "PERSONALIDADE" in tipos
+
+
+def test_personalidade_evolui_apos_campeao():
+    world = World("NEWS_TEST6")
+    club = world.criar_clube_ia("Robot FC", _CORES, personalidade="agressivo")
+    club.divisao = "SERIE_A"
+    world.store.save_club(club)
+    world.seasons[club.id].divisao = "SERIE_A"
+
+    resultado = _force_season_result(world, club.id, 20000)  # pontuação máxima
+
+    assert resultado.resultado == "CAMPEAO"
+    atualizado = world.store.get_club(club.id)
+    assert atualizado.ia_personalidade == "conservador"
+
+
+def test_personalidade_nao_muda_se_clube_humano():
+    """Evolução de personalidade só vale para clube gerenciado por IA."""
+    world = World("NEWS_TEST7")
+    club = world.criar_clube("u1", "Clube Humano", _CORES)
+    club.divisao = "SERIE_C"
+    world.store.save_club(club)
+    world.seasons[club.id].divisao = "SERIE_C"
+
+    _force_season_result(world, club.id, 0)
+
+    atualizado = world.store.get_club(club.id)
+    assert atualizado.ia_personalidade is None
+
+
+def test_comprar_p2p_gera_noticia_de_transferencia():
+    world = World("NEWS_TEST8")
+    vendedor = world.criar_clube_ia("Vendedor FC", _CORES)
+    comprador = world.criar_clube_ia("Comprador FC", _CORES)
+    pid = world.mercado_disponivel()[0].player.id
+    world.comprar(vendedor.id, pid)
+    world.listar_venda(vendedor.id, pid, 1_000_000)
+
+    world.comprar(comprador.id, pid)
+
+    noticias = world.news(club_id=comprador.id)
+    tipos = [n.tipo for n in noticias]
+    assert "TRANSFERENCIA_P2P" in tipos
+
+
+def test_news_filtra_por_club_id():
+    world = World("NEWS_TEST9")
+    a = world.criar_clube_ia("Clube A", _CORES)
+    b = world.criar_clube_ia("Clube B", _CORES)
+
+    apenas_a = world.news(club_id=a.id)
+    assert all(n.club_id == a.id for n in apenas_a)
+    assert len(apenas_a) == 1
+
+    todas = world.news()
+    assert len(todas) == 2
+    assert {n.club_id for n in todas} == {a.id, b.id}
+
+
+def test_news_respeita_limite():
+    world = World("NEWS_TEST10")
+    for i in range(5):
+        world.criar_clube_ia(f"Clube {i}", _CORES)
+
+    assert len(world.news(limit=2)) == 2
+    assert len(world.news(limit=100)) == 5
+
+
+def test_news_mais_recente_primeiro():
+    world = World("NEWS_TEST11")
+    world.criar_clube_ia("Primeiro", _CORES)
+    world.criar_clube_ia("Segundo", _CORES)
+
+    noticias = world.news()
+    assert noticias[0].texto.startswith("Segundo")
+    assert noticias[1].texto.startswith("Primeiro")
+
+
+def test_api_get_news_endpoint(client_factory):
+    client, world = client_factory()
+    world.criar_clube_ia("Robot FC", _CORES)
+
+    r = client.get("/news")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["tipo"] == "FUNDACAO"
+
+
+def test_api_get_news_filtra_por_club_id(client_factory):
+    client, world = client_factory()
+    a = world.criar_clube_ia("Clube A", _CORES)
+    world.criar_clube_ia("Clube B", _CORES)
+
+    r = client.get(f"/news?club_id={a.id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["club_id"] == a.id

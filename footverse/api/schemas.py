@@ -219,6 +219,15 @@ class AiDecisionOut(BaseModel):
     decisao: str
 
 
+# ── feed de notícias ──────────────────────────────────────────────────────
+class NewsItemOut(BaseModel):
+    ts: float
+    club_id: str
+    tipo: str
+    texto: str | None = None
+    resultado: str | None = None
+
+
 # ── autenticação ───────────────────────────────────────────────────────────
 class RegisterIn(BaseModel):
     user_id: str

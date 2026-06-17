@@ -9,8 +9,9 @@ import LineupTab from './tabs/LineupTab'
 import RoundTab from './tabs/RoundTab'
 import SeasonTab from './tabs/SeasonTab'
 import StandingsTab from './tabs/StandingsTab'
+import NewsTab from './tabs/NewsTab'
 
-type Tab = 'market' | 'squad' | 'lineup' | 'round' | 'season' | 'standings'
+type Tab = 'market' | 'squad' | 'lineup' | 'round' | 'season' | 'standings' | 'news'
 
 interface Props {
   clubId: string
@@ -93,6 +94,7 @@ export default function Dashboard({ clubId, onReset }: Props) {
     { key: 'round',     label: 'Rodada' },
     { key: 'season',    label: 'Temporada' },
     { key: 'standings', label: 'Classificação' },
+    { key: 'news',      label: 'Notícias' },
   ]
 
   return (
@@ -195,6 +197,7 @@ export default function Dashboard({ clubId, onReset }: Props) {
       {tab === 'round'     && <RoundTab     clubId={clubId} season={season} onScore={refresh} />}
       {tab === 'season'    && <SeasonTab    clubId={clubId} season={season} onClose={refresh} />}
       {tab === 'standings' && <StandingsTab divisao={club.divisao} myClubId={clubId} />}
+      {tab === 'news'      && <NewsTab      myClubId={clubId} />}
     </div>
   )
 }
